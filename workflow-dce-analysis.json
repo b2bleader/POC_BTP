@@ -1,0 +1,274 @@
+{
+  "name": "POC Analyse DCE BTP",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "analyze-dce",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "1",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1,
+      "position": [240, 300],
+      "webhookId": "analyze-dce"
+    },
+    {
+      "parameters": {
+        "binaryPropertyName": "data",
+        "outputFormat": "eachFile"
+      },
+      "id": "2",
+      "name": "Extract from File",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [460, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Récupère tous les fichiers extraits\nconst items = $input.all();\nconst startTime = Date.now();\n\n// Initialise les catégories\nconst pdfs = [];\nconst excels = [];\nconst ignored = [];\n\n// Trie les fichiers\nfor (const item of items) {\n  const fileName = item.json.fileName || 'unknown';\n  const binaryData = item.binary?.data;\n  \n  if (!binaryData) {\n    ignored.push({ fileName, reason: 'Pas de données binaires' });\n    continue;\n  }\n  \n  // Calcule la taille en bytes\n  const fileSize = Buffer.from(binaryData.data, 'base64').length;\n  const fileSizeMB = (fileSize / 1024 / 1024).toFixed(2);\n  const ext = fileName.toLowerCase().split('.').pop();\n  \n  if (ext === 'pdf') {\n    // Filtre < 10 MB\n    if (fileSize < 10485760) { // 10 MB en bytes\n      pdfs.push({\n        fileName,\n        fileSize,\n        fileSizeMB,\n        base64Data: binaryData.data\n      });\n    } else {\n      ignored.push({ \n        fileName, \n        reason: `Taille ${fileSizeMB} MB > 10 MB (plan technique ignoré)` \n      });\n    }\n  } else if (ext === 'xlsx' || ext === 'xls') {\n    excels.push({\n      fileName,\n      fileSizeMB\n    });\n  } else {\n    ignored.push({ fileName, reason: `Type ${ext} non pris en charge` });\n  }\n}\n\n// Trie les PDFs par taille (décroissant)\npdfs.sort((a, b) => b.fileSize - a.fileSize);\n\n// Limite à 40 PDFs\nconst selectedPdfs = pdfs.slice(0, 40);\n\nif (pdfs.length > 40) {\n  ignored.push({ \n    fileName: `${pdfs.length - 40} PDFs supplémentaires`, \n    reason: 'Limite POC dépassée (40 max)' \n  });\n}\n\n// Retourne les PDFs avec métadonnées partagées\nreturn selectedPdfs.map(pdf => ({\n  json: {\n    fileName: pdf.fileName,\n    fileSize: pdf.fileSize,\n    fileSizeMB: pdf.fileSizeMB + ' MB',\n    base64Data: pdf.base64Data,\n    // Métadonnées globales (propagées)\n    _metadata: {\n      startTime,\n      totalFiles: items.length,\n      totalPdfs: pdfs.length,\n      selectedPdfs: selectedPdfs.length,\n      excelFiles: excels,\n      ignoredFiles: ignored\n    }\n  }\n}));"
+      },
+      "id": "3",
+      "name": "Smart Filter",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [680, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "4",
+      "name": "Split in Batches - Classification",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 1,
+      "position": [900, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Configuration API Claude\nconst ANTHROPIC_API_KEY = 'YOUR_API_KEY_HERE'; // ⚠️ REMPLACE PAR TA CLÉ\nconst API_URL = 'https://api.anthropic.com/v1/messages';\n\n// Récupère les données du PDF\nconst fileName = $input.item.json.fileName;\nconst base64Data = $input.item.json.base64Data;\nconst metadata = $input.item.json._metadata;\n\n// Prompt de classification\nconst classificationPrompt = `Tu es un expert en appels d'offres BTP.\n\nAnalyse ce document et identifie son TYPE en 1 MOT parmi :\n- CCAP (Cahier des Clauses Administratives Particulières)\n- REGLEMENT (Règlement de consultation)\n- PLANNING (Planning des travaux, calendrier)\n- NOTICE (Notice technique, descriptif)\n- DPGF (Détail Quantitatif Estimatif / Bordereau de prix)\n- PLANS (Plans techniques, schémas)\n- ANNEXE (Annexes diverses)\n- INCONNU (si tu ne peux pas déterminer)\n\nIMPORTANT : \n- Ignore les pages de garde administratives (logos, en-têtes)\n- Concentre-toi sur le contenu principal (généralement à partir de la page 3-5)\n- Si le document est un MODIFICATIF ou AVENANT, indique le type de base (ex: CCAP)\n\nRéponds UNIQUEMENT avec le mot-clé en MAJUSCULES, RIEN d'autre.\n\nExemple de réponse valide : CCAP\n\nRéponse :`;\n\n// Prépare le payload pour Claude\nconst payload = {\n  model: 'claude-3-5-sonnet-20241022',\n  max_tokens: 50,\n  messages: [\n    {\n      role: 'user',\n      content: [\n        {\n          type: 'document',\n          source: {\n            type: 'base64',\n            media_type: 'application/pdf',\n            data: base64Data\n          }\n        },\n        {\n          type: 'text',\n          text: classificationPrompt\n        }\n      ]\n    }\n  ]\n};\n\n// Appel API avec gestion d'erreur\ntry {\n  const response = await fetch(API_URL, {\n    method: 'POST',\n    headers: {\n      'x-api-key': ANTHROPIC_API_KEY,\n      'anthropic-version': '2023-06-01',\n      'content-type': 'application/json'\n    },\n    body: JSON.stringify(payload)\n  });\n\n  if (!response.ok) {\n    throw new Error(`API Error: ${response.status} ${response.statusText}`);\n  }\n\n  const result = await response.json();\n  \n  // Extrait le type du contenu de la réponse\n  const rawType = result.content[0]?.text?.trim().toUpperCase() || 'INCONNU';\n  \n  // Nettoie la réponse (parfois Claude ajoute du texte)\n  const validTypes = ['CCAP', 'REGLEMENT', 'PLANNING', 'NOTICE', 'DPGF', 'PLANS', 'ANNEXE', 'INCONNU'];\n  let documentType = 'INCONNU';\n  \n  for (const type of validTypes) {\n    if (rawType.includes(type)) {\n      documentType = type;\n      break;\n    }\n  }\n\n  return {\n    json: {\n      fileName,\n      fileSize: $input.item.json.fileSize,\n      fileSizeMB: $input.item.json.fileSizeMB,\n      base64Data,\n      documentType,\n      classificationRaw: rawType,\n      _metadata: metadata\n    }\n  };\n\n} catch (error) {\n  // En cas d'erreur, continue avec type ERREUR\n  return {\n    json: {\n      fileName,\n      fileSize: $input.item.json.fileSize,\n      fileSizeMB: $input.item.json.fileSizeMB,\n      base64Data,\n      documentType: 'ERREUR',\n      classificationError: error.message,\n      _metadata: metadata\n    }\n  };\n}"
+      },
+      "id": "5",
+      "name": "Claude Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [1120, 300]
+    },
+    {
+      "parameters": {},
+      "id": "6",
+      "name": "Aggregate - Classifications",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [1340, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Récupère tous les documents classifiés\nconst items = $input.all();\n\n// Types pertinents pour analyse détaillée\nconst relevantTypes = ['CCAP', 'REGLEMENT', 'PLANNING', 'NOTICE'];\n\n// Compteurs et listes\nconst typeCount = {};\nconst relevantDocs = [];\nconst ignoredDocs = [];\nconst errorDocs = [];\n\n// Trie les documents\nfor (const item of items) {\n  const type = item.json.documentType;\n  const fileName = item.json.fileName;\n  \n  // Compte les occurrences\n  typeCount[type] = (typeCount[type] || 0) + 1;\n  \n  if (type === 'ERREUR') {\n    errorDocs.push({\n      fileName,\n      error: item.json.classificationError || 'Erreur inconnue'\n    });\n  } else if (relevantTypes.includes(type)) {\n    relevantDocs.push(item.json);\n  } else {\n    ignoredDocs.push({\n      fileName,\n      type\n    });\n  }\n}\n\n// Détecte les doublons (plusieurs docs du même type)\nconst duplicates = [];\nfor (const [type, count] of Object.entries(typeCount)) {\n  if (count > 1 && relevantTypes.includes(type)) {\n    duplicates.push({\n      type,\n      count,\n      warning: `⚠️ ${count} documents de type ${type} détectés - Vérifier les versions/modificatifs`\n    });\n  }\n}\n\n// Récupère les métadonnées du premier item\nconst metadata = items[0]?.json._metadata || {};\n\n// Ajoute les nouvelles métadonnées\nconst enrichedMetadata = {\n  ...metadata,\n  classificationComplete: true,\n  relevantDocsCount: relevantDocs.length,\n  ignoredDocsCount: ignoredDocs.length,\n  errorDocsCount: errorDocs.length,\n  duplicates,\n  ignoredDocs,\n  errorDocs\n};\n\n// Retourne uniquement les docs pertinents pour analyse\nif (relevantDocs.length === 0) {\n  // Cas spécial : aucun doc pertinent trouvé\n  return [{\n    json: {\n      noRelevantDocs: true,\n      _metadata: enrichedMetadata\n    }\n  }];\n}\n\nreturn relevantDocs.map(doc => ({\n  json: {\n    ...doc,\n    _metadata: enrichedMetadata\n  }\n}));"
+      },
+      "id": "7",
+      "name": "Filter Relevant + Duplicates",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [1560, 300]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "8",
+      "name": "Split in Batches - Analysis",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 1,
+      "position": [1780, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// Configuration API Claude\nconst ANTHROPIC_API_KEY = 'YOUR_API_KEY_HERE'; // ⚠️ REMPLACE PAR TA CLÉ\nconst API_URL = 'https://api.anthropic.com/v1/messages';\n\n// Gère le cas \"aucun doc pertinent\"\nif ($input.item.json.noRelevantDocs) {\n  return {\n    json: {\n      noRelevantDocs: true,\n      _metadata: $input.item.json._metadata\n    }\n  };\n}\n\n// Récupère les données\nconst fileName = $input.item.json.fileName;\nconst documentType = $input.item.json.documentType;\nconst base64Data = $input.item.json.base64Data;\nconst metadata = $input.item.json._metadata;\n\n// Vérifie si c'est un doublon\nconst isDuplicate = metadata.duplicates?.some(d => d.type === documentType) || false;\nconst duplicateWarning = isDuplicate \n  ? `\\n⚠️ ATTENTION : Plusieurs documents de type ${documentType} dans ce DCE. Vérifie s'il s'agit d'une version modificative.`\n  : '';\n\n// Détecte les mots-clés modificatifs dans le nom\nconst isModificatif = /modif|avenant|rectif|complement|addendum|v[0-9]|version/i.test(fileName);\n\n// Prompt d'analyse détaillée\nconst analysisPrompt = `Tu analyses un document d'appel d'offres BTP.\n\nCONTEXTE :\n- Type de document : ${documentType}\n- Nom du fichier : ${fileName}${duplicateWarning}\n${isModificatif ? '- 🔄 POSSIBLE MODIFICATIF (détecté dans le nom)' : ''}\n\nTÂCHE :\n1. ${isModificatif ? 'SI MODIFICATIF → Identifie clairement CE QUI CHANGE par rapport à un document précédent' : 'Extrais les informations LES PLUS CRITIQUES pour décider de répondre à cet appel d\\'offres'}\n2. Identifie TOUTES les dates et délais mentionnés\n3. Résume le périmètre/scope du document en 1 phrase\n\nFORMAT DE RÉPONSE (respecte exactement cette structure) :\n\n${isModificatif ? '🔄 MODIFICATIF DÉTECTÉ\\n' : ''}**Scope** : [Description concise du périmètre en 1-2 phrases]\n\n**Points critiques** :\n- [Information critique 1]\n- [Information critique 2]\n- [Information critique 3]\n${documentType === 'CCAP' || documentType === 'REGLEMENT' ? '- [Information critique 4]\\n- [Information critique 5]' : ''}\n\n**⏰ Dates clés** : [Liste toutes les dates trouvées avec leur contexte, ou \"Aucune date identifiée\"]\n\n${isModificatif ? '\\n⚠️ **Impact du modificatif** : [Résumé de ce qui change]' : ''}\n\nIMPORTANT :\n- Sois CONCIS et FACTUEL\n- Ignore les pages de garde administratives\n- Concentre-toi sur les OBLIGATIONS, DÉLAIS, CRITÈRES DE SÉLECTION\n- Pour un CCAP : focalisé sur pénalités, garanties, modalités paiement\n- Pour un REGLEMENT : focalisé sur critères de jugement, procédure\n- Pour un PLANNING : focalisé sur jalons et contraintes temporelles\n- Pour une NOTICE : focalisé sur exigences techniques critiques`;\n\n// Prépare le payload\nconst payload = {\n  model: 'claude-3-5-sonnet-20241022',\n  max_tokens: 1024,\n  messages: [\n    {\n      role: 'user',\n      content: [\n        {\n          type: 'document',\n          source: {\n            type: 'base64',\n            media_type: 'application/pdf',\n            data: base64Data\n          }\n        },\n        {\n          type: 'text',\n          text: analysisPrompt\n        }\n      ]\n    }\n  ]\n};\n\n// Appel API avec gestion d'erreur\ntry {\n  const startAnalysis = Date.now();\n  \n  const response = await fetch(API_URL, {\n    method: 'POST',\n    headers: {\n      'x-api-key': ANTHROPIC_API_KEY,\n      'anthropic-version': '2023-06-01',\n      'content-type': 'application/json'\n    },\n    body: JSON.stringify(payload)\n  });\n\n  if (!response.ok) {\n    throw new Error(`API Error: ${response.status} ${response.statusText}`);\n  }\n\n  const result = await response.json();\n  const analysisTime = ((Date.now() - startAnalysis) / 1000).toFixed(1);\n  \n  // Extrait le contenu de l'analyse\n  const analysisContent = result.content[0]?.text || 'Aucune analyse générée';\n\n  return {\n    json: {\n      fileName,\n      documentType,\n      fileSizeMB: $input.item.json.fileSizeMB,\n      analysis: analysisContent,\n      analysisTime: analysisTime + 's',\n      isModificatif,\n      isDuplicate,\n      _metadata: metadata\n    }\n  };\n\n} catch (error) {\n  // En cas d'erreur, retourne un résultat d'erreur\n  return {\n    json: {\n      fileName,\n      documentType,\n      fileSizeMB: $input.item.json.fileSizeMB,\n      analysis: '❌ Erreur lors de l\\'analyse de ce document',\n      analysisError: error.message,\n      analysisTime: '0s',\n      _metadata: metadata\n    }\n  };\n}"
+      },
+      "id": "9",
+      "name": "Claude Full Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 1,
+      "position": [2000, 300]
+    },
+    {
+      "parameters": {},
+      "id": "10",
+      "name": "Aggregate - Analyses",
+      "type": "n8n-nodes-base.aggregate",
+      "typeVersion": 1,
+      "position": [2220, 300]
+    },
+    {
+      "parameters": {
+        "functionCode": "// VOIR LE CODE COMPLET DANS LE README - Ce code est trop long pour tenir ici\n// Copie le code du Node 11 depuis le README.md\n\nconst items = $input.all();\n\nif (items.length === 1 && items[0].json.noRelevantDocs) {\n  const metadata = items[0].json._metadata;\n  const endTime = Date.now();\n  const processingTime = ((endTime - metadata.startTime) / 1000).toFixed(1);\n  \n  return { json: { html: '<!DOCTYPE html><html><body><h1>Aucun document pertinent trouvé</h1></body></html>' } };\n}\n\nconst metadata = items[0]?.json._metadata || {};\nconst endTime = Date.now();\nconst processingTime = ((endTime - metadata.startTime) / 1000).toFixed(1);\n\nlet documentCards = items.map(item => {\n  const doc = item.json;\n  return `<div class=\"document\"><h3>${doc.fileName}</h3><p>${doc.analysis}</p></div>`;\n}).join('');\n\nconst html = `<!DOCTYPE html>\n<html lang=\"fr\">\n<head>\n    <meta charset=\"UTF-8\">\n    <title>Analyse DCE</title>\n</head>\n<body>\n    <h1>Analyse DCE</h1>\n    <p>Temps: ${processingTime}s</p>\n    ${documentCards}\n</body>\n</html>`;\n\nreturn { json: { html } };"
+      },
+      "id": "11",
+      "name": "Generate HTML",
+      "type": "n8n-nodes-base.function",
+      "typeVersion": 1,
+      "position": [2440, 300]
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {
+          "responseData": "firstEntryJson",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              }
+            ]
+          }
+        }
+      },
+      "id": "12",
+      "name": "Respond to Webhook",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [2660, 300]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Extract from File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract from File": {
+      "main": [
+        [
+          {
+            "node": "Smart Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Smart Filter": {
+      "main": [
+        [
+          {
+            "node": "Split in Batches - Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split in Batches - Classification": {
+      "main": [
+        [
+          {
+            "node": "Claude Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Classification": {
+      "main": [
+        [
+          {
+            "node": "Split in Batches - Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate - Classifications": {
+      "main": [
+        [
+          {
+            "node": "Filter Relevant + Duplicates",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Relevant + Duplicates": {
+      "main": [
+        [
+          {
+            "node": "Split in Batches - Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split in Batches - Analysis": {
+      "main": [
+        [
+          {
+            "node": "Claude Full Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude Full Analysis": {
+      "main": [
+        [
+          {
+            "node": "Split in Batches - Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Aggregate - Analyses": {
+      "main": [
+        [
+          {
+            "node": "Generate HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate HTML": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "executionTimeout": 300,
+    "timezone": "Europe/Paris"
+  },
+  "staticData": null,
+  "tags": [],
+  "triggerCount": 1,
+  "updatedAt": "2024-12-19T00:00:00.000Z",
+  "versionId": "1"
+}
