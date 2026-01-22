@@ -1,0 +1,623 @@
+{
+  "name": "POC Pré-qualification Terrains Constructibles",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "land-qualification",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "id": "1",
+      "name": "Webhook - Input",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [240, 400],
+      "webhookId": "land-qualification",
+      "notes": "Réception des données du terrain via formulaire ou webhook"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Validation et préparation des données d'entrée\nconst input = $input.item.json;\n\n// Extraction des données d'entrée\nconst adresseComplete = input.adresse_complete || input.body?.adresse_complete;\nconst referenceCadastrale = input.reference_cadastrale || input.body?.reference_cadastrale;\nconst latitude = input.latitude || input.body?.latitude;\nconst longitude = input.longitude || input.body?.longitude;\nconst nomContact = input.nom_contact || input.body?.nom_contact || 'Non fourni';\nconst emailContact = input.email_contact || input.body?.email_contact || 'Non fourni';\n\n// Validation des données minimales\nif (!adresseComplete && !referenceCadastrale && (!latitude || !longitude)) {\n  throw new Error('Données insuffisantes : fournissez au moins une adresse, une référence cadastrale, ou des coordonnées GPS');\n}\n\n// Métadonnées de traçabilité\nconst metadata = {\n  startTime: Date.now(),\n  requestId: Date.now().toString(36) + Math.random().toString(36).substr(2),\n  nomContact,\n  emailContact\n};\n\n// Détermine la stratégie de géolocalisation\nlet strategy = 'unknown';\nif (referenceCadastrale) {\n  strategy = 'cadastre_direct';\n} else if (latitude && longitude) {\n  strategy = 'coordinates';\n} else if (adresseComplete) {\n  strategy = 'geocoding_needed';\n}\n\nreturn {\n  json: {\n    adresseComplete,\n    referenceCadastrale,\n    latitude: latitude ? parseFloat(latitude) : null,\n    longitude: longitude ? parseFloat(longitude) : null,\n    strategy,\n    _metadata: metadata\n  }\n};"
+      },
+      "id": "2",
+      "name": "Validation Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [460, 400],
+      "notes": "Valide et normalise les données d'entrée"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "string": [
+            {
+              "value1": "={{ $json.strategy }}",
+              "operation": "equals",
+              "value2": "geocoding_needed"
+            }
+          ]
+        }
+      },
+      "id": "3",
+      "name": "Needs Geocoding?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 1,
+      "position": [680, 400],
+      "notes": "Vérifie si un géocodage est nécessaire"
+    },
+    {
+      "parameters": {
+        "url": "https://api-adresse.data.gouv.fr/search/",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "httpBasicAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "q",
+              "value": "={{ $json.adresseComplete }}"
+            },
+            {
+              "name": "limit",
+              "value": "1"
+            }
+          ]
+        },
+        "options": {
+          "redirect": {
+            "redirect": {
+              "maxRedirects": 3
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "id": "4",
+      "name": "API Géocodage Adresse",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [900, 300],
+      "notes": "Géocode l'adresse via API Adresse",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "functionCode": "// Traite la réponse du géocodage\nconst geocodingData = $input.item.json;\nconst previousData = $input.first().json;\n\nif (!geocodingData.features || geocodingData.features.length === 0) {\n  // Échec du géocodage\n  return {\n    json: {\n      ...previousData,\n      latitude: null,\n      longitude: null,\n      codeInsee: null,\n      adresseNormalisee: previousData.adresseComplete,\n      geocodingStatus: 'failed',\n      geocodingError: 'Adresse non trouvée'\n    }\n  };\n}\n\n// Extraction des coordonnées et du code INSEE\nconst feature = geocodingData.features[0];\nconst coordinates = feature.geometry.coordinates; // [lon, lat]\nconst properties = feature.properties;\n\nreturn {\n  json: {\n    ...previousData,\n    latitude: coordinates[1],\n    longitude: coordinates[0],\n    codeInsee: properties.citycode,\n    adresseNormalisee: properties.label,\n    geocodingStatus: 'success',\n    geocodingScore: properties.score\n  }\n};"
+      },
+      "id": "5",
+      "name": "Process Geocoding",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 300],
+      "notes": "Traite les résultats du géocodage"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "mergeByFields": {
+          "values": [
+            {
+              "field1": "_metadata.requestId",
+              "field2": "_metadata.requestId"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "6",
+      "name": "Merge Geocoding",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2.1,
+      "position": [1120, 500],
+      "notes": "Fusionne les branches avec/sans géocodage"
+    },
+    {
+      "parameters": {
+        "url": "https://apicarto.ign.fr/api/cadastre/parcelle",
+        "authentication": "none",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "geom",
+              "value": "={{ JSON.stringify({\"type\":\"Point\",\"coordinates\":[$json.longitude,$json.latitude]}) }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "7",
+      "name": "API Cadastre",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1340, 400],
+      "notes": "Récupère les données cadastrales de la parcelle",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "functionCode": "// Traite la réponse de l'API Cadastre\nconst cadastreResponse = $input.item.json;\nconst previousData = $input.first().json;\n\n// Gestion d'erreur\nif (!cadastreResponse.features || cadastreResponse.features.length === 0) {\n  return {\n    json: {\n      ...previousData,\n      cadastreData: {\n        status: 'not_found',\n        numero: 'N/A',\n        section: 'N/A',\n        contenance: 0,\n        commune: previousData.codeInsee || 'N/A',\n        geometry: null,\n        referenceCadastrale: 'Indisponible'\n      }\n    }\n  };\n}\n\n// Extraction des données cadastrales\nconst feature = cadastreResponse.features[0];\nconst properties = feature.properties;\nconst geometry = feature.geometry;\n\n// Construction de la référence cadastrale complète\nconst referenceCadastrale = `${properties.commune}${properties.prefixe || ''}${properties.section}${properties.numero}`;\n\nreturn {\n  json: {\n    ...previousData,\n    cadastreData: {\n      status: 'found',\n      numero: properties.numero,\n      section: properties.section,\n      contenance: properties.contenance || 0, // Surface en m²\n      commune: properties.commune,\n      codeCommune: properties.commune,\n      geometry: geometry,\n      referenceCadastrale: referenceCadastrale,\n      adresseCadastrale: properties.adresse_cadastre || previousData.adresseNormalisee || previousData.adresseComplete\n    }\n  }\n};"
+      },
+      "id": "8",
+      "name": "Process Cadastre",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1560, 400],
+      "notes": "Traite les données cadastrales"
+    },
+    {
+      "parameters": {
+        "url": "https://apicarto.ign.fr/api/gpu/zone-urba",
+        "authentication": "none",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "geom",
+              "value": "={{ JSON.stringify($json.cadastreData.geometry || {\"type\":\"Point\",\"coordinates\":[$json.longitude,$json.latitude]}) }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "9",
+      "name": "API GPU Zone PLU",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1780, 400],
+      "notes": "Récupère le zonage PLU",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "https://apicarto.ign.fr/api/gpu/servitude",
+        "authentication": "none",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "geom",
+              "value": "={{ JSON.stringify($json.cadastreData.geometry || {\"type\":\"Point\",\"coordinates\":[$json.longitude,$json.latitude]}) }}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "10",
+      "name": "API GPU Servitudes",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [1780, 600],
+      "notes": "Récupère les servitudes d'utilité publique",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "mergeByFields": {
+          "values": [
+            {
+              "field1": "_metadata.requestId",
+              "field2": "_metadata.requestId"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "11",
+      "name": "Merge PLU & Servitudes",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 2.1,
+      "position": [2000, 500],
+      "notes": "Fusionne zonage PLU et servitudes"
+    },
+    {
+      "parameters": {
+        "functionCode": "// Traite les données PLU et servitudes\nconst pluResponse = $input.first().json;\nconst servitudesResponse = $input.last().json;\nconst previousData = $input.item.json;\n\n// Traitement PLU\nlet pluData = {\n  status: 'not_found',\n  libelle: 'N/A',\n  libelong: 'Zone non identifiée',\n  typezone: 'INCONNU',\n  destdomi: 'N/A'\n};\n\nif (pluResponse.features && pluResponse.features.length > 0) {\n  const pluFeature = pluResponse.features[0].properties;\n  pluData = {\n    status: 'found',\n    libelle: pluFeature.libelle || 'N/A',\n    libelong: pluFeature.libelong || 'Zone PLU non détaillée',\n    typezone: pluFeature.typezone || 'INCONNU',\n    destdomi: pluFeature.destdomi || 'N/A',\n    partition: pluFeature.partition || null\n  };\n}\n\n// Traitement Servitudes\nlet servitudesData = {\n  status: 'none',\n  count: 0,\n  list: []\n};\n\nif (servitudesResponse.features && servitudesResponse.features.length > 0) {\n  servitudesData = {\n    status: 'found',\n    count: servitudesResponse.features.length,\n    list: servitudesResponse.features.map(f => ({\n      categorie: f.properties.categorie || 'Inconnue',\n      libelle: f.properties.libelle || 'Servitude non détaillée',\n      nomfic: f.properties.nomfic || null\n    }))\n  };\n}\n\nreturn {\n  json: {\n    ...previousData,\n    pluData,\n    servitudesData\n  }\n};"
+      },
+      "id": "12",
+      "name": "Process PLU & Servitudes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 500],
+      "notes": "Traite PLU et servitudes"
+    },
+    {
+      "parameters": {
+        "url": "https://apidf-preprod.apur.org/api/records/1.0/search/",
+        "authentication": "none",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "dataset",
+              "value": "dvf"
+            },
+            {
+              "name": "geofilter.distance",
+              "value": "={{ $json.latitude }},{{ $json.longitude }},500"
+            },
+            {
+              "name": "rows",
+              "value": "50"
+            },
+            {
+              "name": "refine.nature_mutation",
+              "value": "Vente"
+            },
+            {
+              "name": "q",
+              "value": "date_mutation:[NOW-24MONTHS TO NOW]"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "13",
+      "name": "API DVF",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [2440, 500],
+      "notes": "Récupère les données de valeur foncière (DVF)",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "functionCode": "// Traite les données DVF (Demande de Valeur Foncière)\nconst dvfResponse = $input.item.json;\nconst previousData = $input.first().json;\n\n// Gestion d'erreur ou absence de données\nif (!dvfResponse.records || dvfResponse.records.length === 0) {\n  return {\n    json: {\n      ...previousData,\n      dvfData: {\n        status: 'no_data',\n        prix_moyen_m2: null,\n        nb_transactions: 0,\n        transactions_recentes: []\n      }\n    }\n  };\n}\n\n// Filtre les transactions de terrains nus\nconst transactions = dvfResponse.records\n  .filter(t => {\n    const fields = t.fields;\n    return (\n      fields.type_local === 'Terrain' ||\n      (fields.nature_culture_speciale && fields.nature_culture_speciale.includes('sol')) ||\n      !fields.type_local // Parfois les terrains n'ont pas de type_local\n    );\n  })\n  .filter(t => {\n    // Filtre les transactions avec valeur et surface valides\n    const fields = t.fields;\n    return (\n      fields.valeur_fonciere &&\n      fields.valeur_fonciere > 0 &&\n      fields.surface_terrain &&\n      fields.surface_terrain > 0\n    );\n  });\n\nif (transactions.length === 0) {\n  return {\n    json: {\n      ...previousData,\n      dvfData: {\n        status: 'no_relevant_data',\n        prix_moyen_m2: null,\n        nb_transactions: 0,\n        transactions_recentes: []\n      }\n    }\n  };\n}\n\n// Calcul du prix moyen au m²\nconst prixMoyenM2 = transactions.reduce((sum, t) => {\n  const fields = t.fields;\n  const prixM2 = fields.valeur_fonciere / fields.surface_terrain;\n  return sum + prixM2;\n}, 0) / transactions.length;\n\n// Sélectionne les 5 transactions les plus récentes\nconst transactionsRecentes = transactions\n  .sort((a, b) => {\n    const dateA = new Date(a.fields.date_mutation);\n    const dateB = new Date(b.fields.date_mutation);\n    return dateB - dateA;\n  })\n  .slice(0, 5)\n  .map(t => ({\n    date: t.fields.date_mutation,\n    valeur: Math.round(t.fields.valeur_fonciere),\n    surface: Math.round(t.fields.surface_terrain),\n    prix_m2: Math.round(t.fields.valeur_fonciere / t.fields.surface_terrain),\n    commune: t.fields.nom_commune || 'N/A'\n  }));\n\nreturn {\n  json: {\n    ...previousData,\n    dvfData: {\n      status: 'success',\n      prix_moyen_m2: Math.round(prixMoyenM2),\n      nb_transactions: transactions.length,\n      transactions_recentes: transactionsRecentes\n    }\n  }\n};"
+      },
+      "id": "14",
+      "name": "Process DVF",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 500],
+      "notes": "Calcule le prix moyen au m² à partir des transactions"
+    },
+    {
+      "parameters": {
+        "functionCode": "// CALCUL DU SCORE DE CONSTRUCTIBILITÉ (sur 100)\nconst data = $input.item.json;\n\nlet score = 50; // Score de base\nlet details = [];\n\n// === BONUS/MALUS ZONE PLU (max +/-30 points) ===\nconst zonePLU = data.pluData.libelle || 'INCONNU';\nconst premierCaractere = zonePLU.charAt(0).toUpperCase();\n\nconst zonesPLU = {\n  'U': { points: +30, label: 'Zone urbaine (constructible)' },\n  'A': { points: +20, label: 'Zone à urbaniser (constructible à terme)' },\n  'N': { points: -20, label: 'Zone agricole (difficilement constructible)' },\n  'R': { points: -30, label: 'Zone naturelle (non constructible)' }\n};\n\nconst zoneInfo = zonesPLU[premierCaractere];\nif (zoneInfo) {\n  score += zoneInfo.points;\n  details.push(`${zoneInfo.points > 0 ? '+' : ''}${zoneInfo.points} pts - ${zoneInfo.label}`);\n} else {\n  details.push('0 pts - Zone PLU non identifiée');\n}\n\n// === MALUS SERVITUDES (max -25 points) ===\nconst nbServitudes = data.servitudesData.count || 0;\nif (nbServitudes > 0) {\n  const malusServitudes = Math.min(nbServitudes * 5, 25); // Max -25 pts\n  score -= malusServitudes;\n  details.push(`-${malusServitudes} pts - ${nbServitudes} servitude(s) détectée(s)`);\n} else {\n  details.push('+0 pts - Aucune servitude détectée');\n}\n\n// === BONUS SURFACE OPTIMALE (+10 points) ===\nconst surface = data.cadastreData.contenance || 0;\nif (surface >= 500 && surface <= 5000) {\n  score += 10;\n  details.push(`+10 pts - Surface optimale (${surface} m²)`);\n} else if (surface > 0 && surface < 500) {\n  details.push(`+0 pts - Surface petite (${surface} m²)`);\n} else if (surface > 5000) {\n  details.push(`+0 pts - Surface importante (${surface} m²)`);\n} else {\n  details.push('+0 pts - Surface non disponible');\n}\n\n// === BONUS DONNÉES DVF (+10 points) ===\nif (data.dvfData.nb_transactions >= 3) {\n  score += 10;\n  details.push(`+10 pts - ${data.dvfData.nb_transactions} transactions récentes dans le secteur`);\n} else if (data.dvfData.nb_transactions > 0) {\n  score += 5;\n  details.push(`+5 pts - ${data.dvfData.nb_transactions} transaction(s) dans le secteur`);\n} else {\n  details.push('+0 pts - Pas de données de marché récentes');\n}\n\n// === NORMALISATION (0-100) ===\nscore = Math.max(0, Math.min(100, score));\n\n// === CATÉGORISATION ===\nlet categorie, categorieColor, recommandation;\n\nif (score >= 70) {\n  categorie = 'Excellent';\n  categorieColor = '#10b981'; // Vert\n  recommandation = 'Terrain à fort potentiel constructible. Recommandation : Lancer une étude de faisabilité approfondie.';\n} else if (score >= 50) {\n  categorie = 'Bon';\n  categorieColor = '#3b82f6'; // Bleu\n  recommandation = 'Terrain avec bon potentiel. Recommandation : Vérifier les contraintes PLU détaillées et consulter le service urbanisme.';\n} else if (score >= 30) {\n  categorie = 'Moyen';\n  categorieColor = '#f59e0b'; // Orange\n  recommandation = 'Terrain avec potentiel limité. Recommandation : Étude approfondie nécessaire, risques de contraintes.';\n} else {\n  categorie = 'Faible';\n  categorieColor = '#ef4444'; // Rouge\n  recommandation = 'Terrain à faible potentiel constructible. Recommandation : Éviter sauf projet spécifique.';\n}\n\n// === PROCHAINES ÉTAPES RECOMMANDÉES ===\nconst prochaines_etapes = [];\n\nif (score >= 50) {\n  prochaines_etapes.push('✅ Demander un certificat d\\'urbanisme opérationnel (CUb)');\n  prochaines_etapes.push('✅ Consulter le PLU complet en mairie');\n  prochaines_etapes.push('✅ Réaliser une étude de sol G1 (géotechnique)');\n  if (data.dvfData.prix_moyen_m2) {\n    prochaines_etapes.push('✅ Estimer le coût d\\'acquisition et la rentabilité');\n  }\n  prochaines_etapes.push('✅ Identifier les réseaux disponibles (eau, électricité, assainissement)');\n} else {\n  prochaines_etapes.push('⚠️ Consulter le service urbanisme de la mairie');\n  prochaines_etapes.push('⚠️ Vérifier les possibilités de dérogation ou de modification du PLU');\n  if (nbServitudes > 0) {\n    prochaines_etapes.push('⚠️ Analyser en détail les servitudes et leur impact');\n  }\n  prochaines_etapes.push('⚠️ Évaluer des usages alternatifs (agricole, forestier, etc.)');\n}\n\n// === ESTIMATION VALEUR (si données DVF disponibles) ===\nlet estimationValeur = null;\nif (data.dvfData.prix_moyen_m2 && surface > 0) {\n  estimationValeur = {\n    prix_m2_secteur: data.dvfData.prix_moyen_m2,\n    valeur_estimee: Math.round(data.dvfData.prix_moyen_m2 * surface),\n    surface: surface,\n    note: 'Estimation basée sur les transactions récentes dans un rayon de 500m'\n  };\n}\n\nreturn {\n  json: {\n    ...data,\n    scoreConstructibilite: {\n      score: score,\n      categorie: categorie,\n      categorieColor: categorieColor,\n      details: details,\n      recommandation: recommandation,\n      prochaines_etapes: prochaines_etapes,\n      estimationValeur: estimationValeur\n    }\n  }\n};"
+      },
+      "id": "15",
+      "name": "Calcul Score Constructibilité",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2880, 500],
+      "notes": "Calcule le score de constructibilité sur 100"
+    },
+    {
+      "parameters": {
+        "functionCode": "// GÉNÉRATION DU HTML POUR LE PDF\nconst data = $input.item.json;\nconst metadata = data._metadata;\nconst endTime = Date.now();\nconst processingTime = ((endTime - metadata.startTime) / 1000).toFixed(1);\n\n// Fonction helper pour formater les nombres\nfunction formatNumber(num) {\n  return new Intl.NumberFormat('fr-FR').format(num);\n}\n\n// Fonction helper pour formater les dates\nfunction formatDate(dateStr) {\n  if (!dateStr) return 'N/A';\n  const date = new Date(dateStr);\n  return date.toLocaleDateString('fr-FR');\n}\n\n// Construction du HTML\nconst html = `<!DOCTYPE html>\n<html lang=\"fr\">\n<head>\n    <meta charset=\"UTF-8\">\n    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n    <title>Fiche de Pré-qualification Foncière</title>\n    <style>\n        * {\n            margin: 0;\n            padding: 0;\n            box-sizing: border-box;\n        }\n        \n        body {\n            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;\n            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);\n            padding: 20px;\n            color: #333;\n        }\n        \n        .container {\n            max-width: 900px;\n            margin: 0 auto;\n            background: white;\n            border-radius: 16px;\n            box-shadow: 0 20px 60px rgba(0,0,0,0.3);\n            overflow: hidden;\n        }\n        \n        .header {\n            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);\n            color: white;\n            padding: 40px;\n            text-align: center;\n        }\n        \n        .header h1 {\n            font-size: 32px;\n            margin-bottom: 10px;\n            font-weight: 700;\n        }\n        \n        .header p {\n            font-size: 16px;\n            opacity: 0.9;\n        }\n        \n        .score-badge {\n            display: inline-block;\n            background: white;\n            color: ${data.scoreConstructibilite.categorieColor};\n            padding: 20px 40px;\n            border-radius: 50px;\n            margin: 20px 0;\n            box-shadow: 0 10px 30px rgba(0,0,0,0.2);\n        }\n        \n        .score-badge .score-number {\n            font-size: 48px;\n            font-weight: 900;\n            display: block;\n        }\n        \n        .score-badge .score-label {\n            font-size: 18px;\n            font-weight: 600;\n            text-transform: uppercase;\n        }\n        \n        .content {\n            padding: 40px;\n        }\n        \n        .section {\n            margin-bottom: 35px;\n            border-left: 4px solid ${data.scoreConstructibilite.categorieColor};\n            padding-left: 20px;\n        }\n        \n        .section h2 {\n            font-size: 24px;\n            color: #667eea;\n            margin-bottom: 15px;\n            display: flex;\n            align-items: center;\n        }\n        \n        .section h2 .icon {\n            font-size: 28px;\n            margin-right: 12px;\n        }\n        \n        .info-grid {\n            display: grid;\n            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));\n            gap: 20px;\n            margin-top: 15px;\n        }\n        \n        .info-item {\n            background: #f8fafc;\n            padding: 15px;\n            border-radius: 8px;\n            border: 1px solid #e2e8f0;\n        }\n        \n        .info-item .label {\n            font-size: 12px;\n            color: #64748b;\n            text-transform: uppercase;\n            font-weight: 600;\n            margin-bottom: 5px;\n        }\n        \n        .info-item .value {\n            font-size: 18px;\n            color: #1e293b;\n            font-weight: 600;\n        }\n        \n        .warning-box {\n            background: #fef3c7;\n            border-left: 4px solid #f59e0b;\n            padding: 20px;\n            border-radius: 8px;\n            margin: 20px 0;\n        }\n        \n        .warning-box h3 {\n            color: #92400e;\n            margin-bottom: 10px;\n            font-size: 18px;\n        }\n        \n        .recommendation-box {\n            background: linear-gradient(135deg, ${data.scoreConstructibilite.categorieColor}15, ${data.scoreConstructibilite.categorieColor}05);\n            border: 2px solid ${data.scoreConstructibilite.categorieColor};\n            padding: 25px;\n            border-radius: 12px;\n            margin: 20px 0;\n        }\n        \n        .recommendation-box h3 {\n            color: ${data.scoreConstructibilite.categorieColor};\n            margin-bottom: 15px;\n            font-size: 20px;\n        }\n        \n        .details-list {\n            list-style: none;\n            margin-top: 15px;\n        }\n        \n        .details-list li {\n            padding: 10px 0;\n            border-bottom: 1px solid #e2e8f0;\n            font-size: 15px;\n            color: #475569;\n        }\n        \n        .details-list li:last-child {\n            border-bottom: none;\n        }\n        \n        .steps-list {\n            list-style: none;\n            margin-top: 15px;\n        }\n        \n        .steps-list li {\n            padding: 12px;\n            margin-bottom: 8px;\n            background: white;\n            border-radius: 8px;\n            font-size: 15px;\n            box-shadow: 0 2px 4px rgba(0,0,0,0.05);\n        }\n        \n        .transactions-table {\n            width: 100%;\n            border-collapse: collapse;\n            margin-top: 15px;\n        }\n        \n        .transactions-table th {\n            background: #667eea;\n            color: white;\n            padding: 12px;\n            text-align: left;\n            font-size: 13px;\n            text-transform: uppercase;\n        }\n        \n        .transactions-table td {\n            padding: 12px;\n            border-bottom: 1px solid #e2e8f0;\n            font-size: 14px;\n        }\n        \n        .transactions-table tr:hover {\n            background: #f8fafc;\n        }\n        \n        .footer {\n            background: #1e293b;\n            color: white;\n            padding: 30px;\n            text-align: center;\n            font-size: 13px;\n        }\n        \n        .footer p {\n            margin: 5px 0;\n        }\n        \n        .servitude-item {\n            background: #fef2f2;\n            border-left: 3px solid #ef4444;\n            padding: 12px;\n            margin-bottom: 8px;\n            border-radius: 6px;\n        }\n        \n        .servitude-item strong {\n            color: #991b1b;\n        }\n    </style>\n</head>\n<body>\n    <div class=\"container\">\n        <!-- HEADER -->\n        <div class=\"header\">\n            <h1>📋 FICHE DE PRÉ-QUALIFICATION FONCIÈRE</h1>\n            <p>Rapport d'analyse automatisée</p>\n            <div class=\"score-badge\">\n                <span class=\"score-number\">${data.scoreConstructibilite.score}/100</span>\n                <span class=\"score-label\">${data.scoreConstructibilite.categorie}</span>\n            </div>\n        </div>\n        \n        <!-- CONTENT -->\n        <div class=\"content\">\n            <!-- LOCALISATION -->\n            <div class=\"section\">\n                <h2><span class=\"icon\">📍</span> Localisation</h2>\n                <div class=\"info-grid\">\n                    <div class=\"info-item\">\n                        <div class=\"label\">Adresse</div>\n                        <div class=\"value\">${data.adresseNormalisee || data.adresseComplete || 'Non fournie'}</div>\n                    </div>\n                    <div class=\"info-item\">\n                        <div class=\"label\">Référence cadastrale</div>\n                        <div class=\"value\">${data.cadastreData.referenceCadastrale || 'N/A'}</div>\n                    </div>\n                    <div class=\"info-item\">\n                        <div class=\"label\">Commune</div>\n                        <div class=\"value\">${data.cadastreData.codeCommune || data.codeInsee || 'N/A'}</div>\n                    </div>\n                    <div class=\"info-item\">\n                        <div class=\"label\">Coordonnées GPS</div>\n                        <div class=\"value\">${data.latitude ? data.latitude.toFixed(6) : 'N/A'}, ${data.longitude ? data.longitude.toFixed(6) : 'N/A'}</div>\n                    </div>\n                </div>\n            </div>\n            \n            <!-- CARACTÉRISTIQUES -->\n            <div class=\"section\">\n                <h2><span class=\"icon\">📐</span> Caractéristiques du terrain</h2>\n                <div class=\"info-grid\">\n                    <div class=\"info-item\">\n                        <div class=\"label\">Surface cadastrale</div>\n                        <div class=\"value\">${data.cadastreData.contenance > 0 ? formatNumber(data.cadastreData.contenance) + ' m²' : 'N/A'}</div>\n                    </div>\n                    <div class=\"info-item\">\n                        <div class=\"label\">Zone PLU</div>\n                        <div class=\"value\">${data.pluData.libelle}</div>\n                    </div>\n                    <div class=\"info-item\">\n                        <div class=\"label\">Description zone</div>\n                        <div class=\"value\" style=\"font-size: 14px;\">${data.pluData.libelong}</div>\n                    </div>\n                    <div class=\"info-item\">\n                        <div class=\"label\">Servitudes détectées</div>\n                        <div class=\"value\">${data.servitudesData.count} servitude(s)</div>\n                    </div>\n                </div>\n                \n                ${data.servitudesData.count > 0 ? `\n                <div class=\"warning-box\" style=\"margin-top: 20px;\">\n                    <h3>⚠️ Servitudes d'utilité publique (SUP)</h3>\n                    ${data.servitudesData.list.map(s => `\n                        <div class=\"servitude-item\">\n                            <strong>${s.categorie}</strong> - ${s.libelle}\n                        </div>\n                    `).join('')}\n                </div>\n                ` : ''}\n            </div>\n            \n            <!-- DONNÉES MARCHÉ -->\n            <div class=\"section\">\n                <h2><span class=\"icon\">💰</span> Données de marché (DVF)</h2>\n                ${data.dvfData.nb_transactions > 0 ? `\n                <div class=\"info-grid\">\n                    <div class=\"info-item\">\n                        <div class=\"label\">Prix moyen secteur</div>\n                        <div class=\"value\">${formatNumber(data.dvfData.prix_moyen_m2)} €/m²</div>\n                    </div>\n                    <div class=\"info-item\">\n                        <div class=\"label\">Transactions analysées</div>\n                        <div class=\"value\">${data.dvfData.nb_transactions} vente(s)</div>\n                    </div>\n                    <div class=\"info-item\">\n                        <div class=\"label\">Période</div>\n                        <div class=\"value\">24 derniers mois</div>\n                    </div>\n                    ${data.scoreConstructibilite.estimationValeur ? `\n                    <div class=\"info-item\">\n                        <div class=\"label\">Valeur estimée</div>\n                        <div class=\"value\">${formatNumber(data.scoreConstructibilite.estimationValeur.valeur_estimee)} €</div>\n                    </div>\n                    ` : ''}\n                </div>\n                \n                ${data.dvfData.transactions_recentes.length > 0 ? `\n                <h3 style=\"margin-top: 25px; margin-bottom: 10px; font-size: 16px; color: #475569;\">Transactions récentes</h3>\n                <table class=\"transactions-table\">\n                    <thead>\n                        <tr>\n                            <th>Date</th>\n                            <th>Surface</th>\n                            <th>Prix</th>\n                            <th>Prix/m²</th>\n                            <th>Commune</th>\n                        </tr>\n                    </thead>\n                    <tbody>\n                        ${data.dvfData.transactions_recentes.map(t => `\n                            <tr>\n                                <td>${formatDate(t.date)}</td>\n                                <td>${formatNumber(t.surface)} m²</td>\n                                <td>${formatNumber(t.valeur)} €</td>\n                                <td>${formatNumber(t.prix_m2)} €/m²</td>\n                                <td>${t.commune}</td>\n                            </tr>\n                        `).join('')}\n                    </tbody>\n                </table>\n                ` : ''}\n                ` : `\n                <div class=\"warning-box\">\n                    <h3>ℹ️ Données de marché indisponibles</h3>\n                    <p>Aucune transaction de terrain n'a été trouvée dans un rayon de 500m au cours des 24 derniers mois.</p>\n                </div>\n                `}\n            </div>\n            \n            <!-- SCORE DE CONSTRUCTIBILITÉ -->\n            <div class=\"section\">\n                <h2><span class=\"icon\">⭐</span> Score de constructibilité</h2>\n                <div class=\"recommendation-box\">\n                    <h3>Évaluation : ${data.scoreConstructibilite.categorie} (${data.scoreConstructibilite.score}/100)</h3>\n                    <p style=\"font-size: 15px; line-height: 1.6; color: #475569;\">${data.scoreConstructibilite.recommandation}</p>\n                </div>\n                \n                <h3 style=\"margin-top: 20px; margin-bottom: 10px; font-size: 18px; color: #475569;\">Détails du scoring</h3>\n                <ul class=\"details-list\">\n                    ${data.scoreConstructibilite.details.map(detail => `<li>${detail}</li>`).join('')}\n                </ul>\n            </div>\n            \n            <!-- PROCHAINES ÉTAPES -->\n            <div class=\"section\">\n                <h2><span class=\"icon\">🔍</span> Prochaines étapes recommandées</h2>\n                <ul class=\"steps-list\">\n                    ${data.scoreConstructibilite.prochaines_etapes.map(etape => `<li>${etape}</li>`).join('')}\n                </ul>\n            </div>\n        </div>\n        \n        <!-- FOOTER -->\n        <div class=\"footer\">\n            <p><strong>Fiche générée automatiquement</strong></p>\n            <p>Contact : ${metadata.nomContact} (${metadata.emailContact})</p>\n            <p>ID Requête : ${metadata.requestId} | Temps de traitement : ${processingTime}s</p>\n            <p style=\"margin-top: 15px; font-size: 11px; opacity: 0.8;\">⚠️ Ce rapport est une pré-qualification automatisée basée sur des données publiques. Une étude d'urbanisme approfondie est nécessaire avant tout projet.</p>\n        </div>\n    </div>\n</body>\n</html>`;\n\nreturn {\n  json: {\n    html: html,\n    filename: `prequalification_${data.cadastreData.referenceCadastrale || 'terrain'}_${metadata.requestId}.html`,\n    score: data.scoreConstructibilite.score,\n    categorie: data.scoreConstructibilite.categorie,\n    summary: {\n      adresse: data.adresseNormalisee || data.adresseComplete,\n      reference_cadastrale: data.cadastreData.referenceCadastrale,\n      surface_m2: data.cadastreData.contenance,\n      zone_plu: data.pluData.libelle,\n      score_constructibilite: data.scoreConstructibilite.score,\n      categorie: data.scoreConstructibilite.categorie,\n      prix_estime: data.scoreConstructibilite.estimationValeur?.valeur_estimee || null,\n      nb_servitudes: data.servitudesData.count\n    },\n    _metadata: metadata,\n    _fullData: data\n  }\n};"
+      },
+      "id": "16",
+      "name": "Generate HTML Report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [3100, 500],
+      "notes": "Génère le rapport HTML de synthèse"
+    },
+    {
+      "parameters": {
+        "url": "https://api.hubapi.com/crm/v3/objects/deals",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "hubspotApi",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "properties",
+              "value": "={{ JSON.stringify({\n  dealname: \"Terrain - \" + $json.summary.adresse,\n  amount: $json.summary.prix_estime || 0,\n  pipeline: \"default\",\n  dealstage: \"qualificationstage\",\n  custom_score_constructibilite: $json.summary.score_constructibilite,\n  custom_surface_m2: $json.summary.surface_m2,\n  custom_zone_plu: $json.summary.zone_plu,\n  custom_reference_cadastrale: $json.summary.reference_cadastrale,\n  custom_nb_servitudes: $json.summary.nb_servitudes,\n  custom_categorie: $json.summary.categorie\n}) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "17",
+      "name": "Send to HubSpot",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3320, 400],
+      "notes": "Envoie les données vers HubSpot CRM",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.WEBHOOK_URL || \"https://webhook.site/your-webhook-url\" }}",
+        "authentication": "none",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "bodyParameters": {
+          "parameters": [
+            {
+              "name": "data",
+              "value": "={{ JSON.stringify($json) }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "18",
+      "name": "Send to Webhook (Alternative)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [3320, 600],
+      "notes": "Alternative : envoie vers webhook générique",
+      "continueOnFail": true
+    },
+    {
+      "parameters": {
+        "respondWith": "allIncomingItems",
+        "options": {
+          "responseData": "firstEntryJson",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Content-Type",
+                "value": "text/html; charset=utf-8"
+              },
+              {
+                "name": "Content-Disposition",
+                "value": "inline; filename=\"{{ $json.filename }}\""
+              }
+            ]
+          }
+        }
+      },
+      "id": "19",
+      "name": "Respond with HTML",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [3540, 500],
+      "notes": "Retourne le rapport HTML au client"
+    }
+  ],
+  "connections": {
+    "Webhook - Input": {
+      "main": [
+        [
+          {
+            "node": "Validation Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validation Input": {
+      "main": [
+        [
+          {
+            "node": "Needs Geocoding?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Needs Geocoding?": {
+      "main": [
+        [
+          {
+            "node": "API Géocodage Adresse",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Merge Geocoding",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "API Géocodage Adresse": {
+      "main": [
+        [
+          {
+            "node": "Process Geocoding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Geocoding": {
+      "main": [
+        [
+          {
+            "node": "Merge Geocoding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Geocoding": {
+      "main": [
+        [
+          {
+            "node": "API Cadastre",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API Cadastre": {
+      "main": [
+        [
+          {
+            "node": "Process Cadastre",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Cadastre": {
+      "main": [
+        [
+          {
+            "node": "API GPU Zone PLU",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "API GPU Servitudes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API GPU Zone PLU": {
+      "main": [
+        [
+          {
+            "node": "Merge PLU & Servitudes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API GPU Servitudes": {
+      "main": [
+        [
+          {
+            "node": "Merge PLU & Servitudes",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge PLU & Servitudes": {
+      "main": [
+        [
+          {
+            "node": "Process PLU & Servitudes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process PLU & Servitudes": {
+      "main": [
+        [
+          {
+            "node": "API DVF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "API DVF": {
+      "main": [
+        [
+          {
+            "node": "Process DVF",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process DVF": {
+      "main": [
+        [
+          {
+            "node": "Calcul Score Constructibilité",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calcul Score Constructibilité": {
+      "main": [
+        [
+          {
+            "node": "Generate HTML Report",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate HTML Report": {
+      "main": [
+        [
+          {
+            "node": "Send to HubSpot",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send to Webhook (Alternative)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Respond with HTML",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "executionTimeout": 120,
+    "timezone": "Europe/Paris"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "createdAt": "2026-01-22T00:00:00.000Z",
+      "updatedAt": "2026-01-22T00:00:00.000Z",
+      "id": "1",
+      "name": "Immobilier"
+    },
+    {
+      "createdAt": "2026-01-22T00:00:00.000Z",
+      "updatedAt": "2026-01-22T00:00:00.000Z",
+      "id": "2",
+      "name": "Foncier"
+    }
+  ],
+  "triggerCount": 1,
+  "updatedAt": "2026-01-22T00:00:00.000Z",
+  "versionId": "1.0.0"
+}
